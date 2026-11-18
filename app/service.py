@@ -232,10 +232,12 @@ class IndexBuildService:
 
         不重跑任何 CREATE INDEX；无效索引不会被报成成功。
         """
-        # 仅在轮次表缺失时才执行 DDL（避免在存在未提交写事务时因 DDL 锁阻塞对账）。
+        # 仅在必需对象缺失时才执行 DDL（避免在存在未提交写事务时因 DDL 锁阻塞对账）。
+        # 同时覆盖升级场景：旧版本库没有 report_rejections 时补齐拒收表与触发器。
         with db.pool().connection() as conn:
             exists = conn.execute(
-                "SELECT to_regclass('public.index_build_rounds') IS NOT NULL AS ok"
+                "SELECT to_regclass('public.index_build_rounds') IS NOT NULL "
+                "AND to_regclass('public.report_rejections') IS NOT NULL AS ok"
             ).fetchone()["ok"]
         if not exists:
             db.ensure_schema()

@@ -9,7 +9,9 @@ from fastapi import FastAPI, HTTPException, status
 
 from . import db
 from .responses import AppJSONResponse
-from .schemas import BatchReportIn, ReportIn, ReportOut
+from .retraction import is_rejected_key_error
+from . import retraction as retraction_service
+from .schemas import BatchReportIn, ReportIn, ReportOut, RetractIn
 from .service import service
 
 logging.basicConfig(
@@ -51,9 +53,23 @@ def health() -> dict:
 
 # ------------------------------ 补录 ------------------------------------
 
+def _rejected_http_exception(payload: ReportIn, exc: psycopg.Error) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "report_retracted",
+            "message": "该实验室下此报告号已被撤回并登记拒收，补录被拒绝",
+            "lab_no": payload.lab_no,
+            "report_no": payload.report_no,
+            "pg_error": str(exc).strip(),
+        },
+    )
+
+
 @app.post("/reports", response_model=ReportOut, status_code=201)
 def insert_report(payload: ReportIn):
-    """单条补录。构建期间（CONCURRENTLY）可正常提交；唯一索引生效后重复键返回 409。"""
+    """单条补录。构建期间（CONCURRENTLY）可正常提交；唯一索引生效后重复键返回 409；
+    命中撤回拒收键（含独立 SQL / UPDATE 改键，由数据库触发器兜底）返回 409。"""
     try:
         with db.pool().connection() as conn:
             row = conn.execute(
@@ -73,15 +89,21 @@ def insert_report(payload: ReportIn):
                 "pg_error": str(exc).strip(),
             },
         )
+    except psycopg.Error as exc:
+        if is_rejected_key_error(exc):
+            raise _rejected_http_exception(payload, exc)
+        raise
     return dict(row)
 
 
 @app.post("/reports/batch")
 def insert_reports_batch(payload: BatchReportIn):
-    """批量补录：逐条保存，重复键跳过且不影响其它行，返回成功/跳过明细。"""
+    """批量补录：逐条保存，重复键/撤回键跳过且不影响其它行，返回成功/跳过明细。"""
     inserted, skipped = [], []
     with db.pool().connection() as conn:
         for item in payload.items:
+            # 每条用保存点隔离：单行失败只回滚该行，前面已成功的行不被连带撤销。
+            conn.execute("SAVEPOINT item")
             try:
                 row = conn.execute(
                     "INSERT INTO reports (lab_no, report_no, measured) "
@@ -90,14 +112,49 @@ def insert_reports_batch(payload: BatchReportIn):
                 ).fetchone()
                 inserted.append(dict(row))
             except psycopg.errors.UniqueViolation:
-                conn.rollback()
+                conn.execute("ROLLBACK TO SAVEPOINT item")
                 skipped.append(
                     {"lab_no": item.lab_no, "report_no": item.report_no,
                      "reason": "duplicate_report"}
                 )
+            except psycopg.Error as exc:
+                if is_rejected_key_error(exc):
+                    conn.execute("ROLLBACK TO SAVEPOINT item")
+                    skipped.append(
+                        {"lab_no": item.lab_no, "report_no": item.report_no,
+                         "reason": "report_retracted"}
+                    )
+                else:
+                    raise
         conn.commit()
     return {"inserted_count": len(inserted), "skipped_count": len(skipped),
             "inserted": inserted, "skipped": skipped}
+
+
+@app.post("/reports/retract", status_code=201)
+def retract_report(payload: RetractIn):
+    """撤回误收报告：单事务原子删除该 (lab_no, report_no) 下全部 reports 行
+    （唯一索引未生效时的同号多行也全部剔除）并登记拒收。
+
+    * 首次撤回返回 201；同键重试返回 200 与已有撤回结果（retried=true）；
+    * 撤回后任何补录或把别的报告改为该键都被数据库触发器拒绝（API 与独立 SQL 同效）；
+    * 其他实验室的同号报告不受影响。
+    """
+    view, code = retraction_service.retract_report(payload.lab_no, payload.report_no)
+    return AppJSONResponse(view, status_code=code)
+
+
+@app.get("/reports/retract")
+def get_retraction(lab_no: str, report_no: str):
+    """查询某键的拒收登记；未登记返回 404。"""
+    view = retraction_service.get_rejection(lab_no, report_no)
+    if view is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "retraction_not_found",
+                    "lab_no": lab_no, "report_no": report_no},
+        )
+    return view
 
 
 @app.get("/reports")

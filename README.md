@@ -29,15 +29,21 @@ docker compose up --build
 目标唯一索引：`uq_reports_lab_no_report_no ON reports (lab_no, report_no)`，
 键为「实验室号 + 报告号」，即**实验室内报告号唯一**（不同实验室允许相同报告号）。
 
+拒收登记表 `report_rejections`：实验室撤回误收报告后，按同一键登记一条拒收记录，
+`reports` 上的行级触发器 `trg_reports_rejection_guard` 据此拦截该键的一切
+INSERT / 改键 UPDATE（API 与独立 SQL 同效）。
+
 另有轮次表 `index_build_rounds` 持久化每次构建的状态、后端 PID 与错误信息，用于重启接续。
 
 ## 3. API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/reports` | 单条补录；唯一索引生效后重复键返回 `409`，原数据不变 |
-| POST | `/reports/batch` | 批量补录，重复键逐条跳过，返回成功/跳过明细 |
+| POST | `/reports` | 单条补录；唯一索引生效后重复键返回 `409`；命中撤回拒收键返回 `409 report_retracted` |
+| POST | `/reports/batch` | 批量补录，重复键/拒收键逐条跳过，返回成功/跳过明细 |
 | GET | `/reports` | 分页查询报告 |
+| POST | `/reports/retract` | 撤回误收报告：原子删除该键全部行并登记拒收；首次 `201`，同键重试 `200 retried=true` |
+| GET | `/reports/retract` | 查询某键拒收登记，未登记返回 `404` |
 | POST | `/index/build` | 发起/复用 `CREATE UNIQUE INDEX CONCURRENTLY`（202） |
 | GET | `/index/status` | 查询轮次状态 + `pg_index` 中索引的真实有效性 |
 | POST | `/index/cancel` | 受理取消（202 `cancel_requested`），SQL 确认停止后才 `cancelled` |
@@ -70,10 +76,30 @@ running ──受理取消──▶ cancel_requested ──后端 SQL 确认停�
 - **失败残留安全清理**：只删除经 `pg_index` 确认 `indisvalid=false` 的索引；
   有效唯一索引永远不会被删除。DROP 带 `lock_timeout` 重试，不被长事务无限挂起。
 
+### 撤回误收报告（POST /reports/retract）
+
+- **原子性，杜绝中间态**：撤回在单事务内完成「取键级 advisory 锁 → 删除该键全部
+  reports 行 → 写入 `report_rejections` 拒收登记」。提交则删除与登记同时生效；
+  失败或回滚则两者皆无——不可能出现“行已删除却未登记拒收”或“已登记却仍有原报告”。
+- **唯一索引未生效也能剔除干净**：`DELETE ... WHERE lab_no=? AND report_no=?`
+  不依赖唯一索引，同号多行一次全部删除，删除行数写入 `deleted_rows`。
+- **撤回/补录严格串行（同一把 advisory 锁）**：补录触发器与撤回事务都调用
+  `report_key_advisory_lock(lab_no, report_no)`：
+  - 撤回先到：补录在锁上等待，撤回提交后触发器读到拒收登记 → 拒绝（SQLSTATE `R9001`）；
+  - 补录先到：撤回等锁，补录提交后 DELETE 会把刚写入的行一并删掉。
+
+  因此成功撤回响应之后，该键不可能再残留任何报告，上游重传无法把它补回。
+- **全路径拦截，不限 API**：守卫是数据库 BEFORE 行触发器，独立 SQL 的 INSERT、
+  以及把别的报告 UPDATE 改键到拒收键，同样被拒；不改键的普通更新不受影响。
+- **仅作用于该键**：拒收唯一约束含 `lab_no`，其他实验室的同号报告正常补录。
+- **同键重试幂等**：再次撤回直接返回既有登记（`retried=true`，HTTP 200），
+  不重复删除、不重复登记。
+
 ## 5. 独立 SQL
 
 - `sql/02_backfill_examples.sql`：不依赖 API 的补录示例（单条/批量/外部表，含 `ON CONFLICT DO NOTHING`）。
 - `sql/03_dedupe.sql`：重复键排查与去重（保留每组最早一条）。
+- `sql/04_retraction.sql`：不依赖 API 的撤回脚本（加锁 + 删除 + 登记同事务）与拒收效果验证。
 
 ## 6. 演示
 
@@ -84,6 +110,7 @@ bash demo/01_long_transaction.sh   # 长事务拖慢构建 + 构建期补录照�
 bash demo/02_duplicate_key.sh      # 重复键失败->原数据保留->去重重试成功->409
 bash demo/03_restart_recovery.sh   # API 重启接续跟踪，不重跑、不虚报
 bash demo/04_cancel.sh             # 取消受理/确认、不误伤补录、有效索引不删除
+bash demo/05_retraction.sh         # 撤回删除+拒收登记+全路径拒绝+幂等重试+在线建索引不受影响
 ```
 
 > 受限沙箱若禁止进程信号，`pg_cancel_backend` 无法中止后端；演示 4 会如实展示
@@ -101,9 +128,9 @@ pytest -q
 ## 8. 目录结构
 
 ```
-app/            FastAPI 应用（main 路由、service 构建编排、db 访问层、schemas）
-sql/            建表、补录示例、去重脚本
-demo/           四个端到端演示 + 长事务持有助手
-tests/          pytest 关键功能自测（9 个用例）
+app/            FastAPI 应用（main 路由、service 构建编排、retraction 撤回服务、db 访问层、schemas）
+sql/            建表、补录示例、去重脚本、撤回脚本
+demo/           五个端到端演示 + 长事务持有助手
+tests/          pytest 关键功能自测（20 个用例，含撤回/补录交错）
 Dockerfile, docker-compose.yml, requirements.txt
 ```

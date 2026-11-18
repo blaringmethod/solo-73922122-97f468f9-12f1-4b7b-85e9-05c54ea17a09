@@ -16,3 +16,8 @@ class ReportOut(ReportIn):
 
 class BatchReportIn(BaseModel):
     items: list[ReportIn] = Field(..., min_length=1)
+
+
+class RetractIn(BaseModel):
+    lab_no: str = Field(..., min_length=1, description="实验室号（非空）")
+    report_no: str = Field(..., min_length=1, description="实验室内报告号（非空）")
